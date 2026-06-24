@@ -5,3 +5,5 @@ __pycache__/
 .env
 *.log
 vehicle_captures/
+kafka_consumer.py
+
