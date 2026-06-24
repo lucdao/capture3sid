@@ -1,0 +1,51 @@
+services:
+  vehicle-capture-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vehicle-capture-service
+    restart: unless-stopped
+    command:
+      - python
+      - snapshot.py
+      - --config
+      - /app/camera_groups.yaml
+      - --broker
+      - ${KAFKA_BROKER:-192.168.1.199:9092}
+      - --topic
+      - ${KAFKA_TOPIC:-ai.metadata.v1}
+      - --group-id
+      - ${KAFKA_GROUP_ID:-vehicle-capture-service}
+      - --offset
+      - ${KAFKA_OFFSET:-latest}
+      - --confidence-threshold
+      - ${CONFIDENCE_THRESHOLD:-0.99}
+      - --cooldown-sec
+      - ${COOLDOWN_SEC:-60}
+      - --max-event-age-sec
+      - ${MAX_EVENT_AGE_SEC:-120}
+      - --output-root
+      - /data/vehicle_captures
+      - --snapshot-base-url
+      - ${SNAPSHOT_BASE_URL:-http://192.168.1.199:9999/snapshot_rtsp}
+      - --snapshot-token
+      - ${SNAPSHOT_TOKEN:-}
+      - --request-timeout-sec
+      - ${REQUEST_TIMEOUT_SEC:-3}
+      - --retries
+      - ${SNAPSHOT_RETRIES:-1}
+      - --log-level
+      - ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./camera_groups.yaml:/app/camera_groups.yaml:ro
+      - ./server_assets/vehicle_captures:/data/vehicle_captures
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import pathlib, sys; sys.exit(0 if 'snapshot.py' in pathlib.Path('/proc/1/cmdline').read_text(errors='ignore') else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

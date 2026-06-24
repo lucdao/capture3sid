@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.git/
+.env
+server_assets/
+vehicle_captures/
+*.log
+echo "ten_file.py" >> .gitignore

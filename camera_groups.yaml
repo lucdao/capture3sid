@@ -1,0 +1,10 @@
+camera_groups:
+  vehicle_lane_01:
+    ai_camera: back
+    cameras:
+      front:
+        cam_id: 2910D-02
+      back:
+        cam_id: 2910D-01
+      side:
+        cam_id: 2910D-03
