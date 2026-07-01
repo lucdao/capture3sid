@@ -31,17 +31,27 @@ import yaml
 DEFAULT_BROKER = "127.0.0.1:9092"
 DEFAULT_TOPIC = "ai.metadata.v1"
 DEFAULT_GROUP_ID = "vehicle-capture-service"
-DEFAULT_CONFIDENCE_THRESHOLD = 0.96
+DEFAULT_CONFIDENCE_THRESHOLD = 0.99
 DEFAULT_COOLDOWN_SEC = 60.0
 DEFAULT_OUTPUT_ROOT = "server_assets/vehicle_captures"
 DEFAULT_REQUEST_TIMEOUT_SEC = 3.0
 DEFAULT_RETRIES = 1
 DEFAULT_POLL_TIMEOUT_SEC = 1.0
 DEFAULT_MAX_EVENT_AGE_SEC = 120.0
+DEFAULT_CROP_EXPAND_RATIO = 0.30
 DEFAULT_VEHICLE_TYPES = ("car", "truck", "bus", "vehicle")
+CAPTURE_EVENT_TYPES = ("object_update", "object_exist")
 
-DEFAULT_SNAPSHOT_BASE_URL = "http://192.168.100.154:9999/snapshot_rtsp"
+DEFAULT_SNAPSHOT_BASE_URL = "http://192.168.1.199:9999/snapshot_rtsp"
 DEFAULT_SNAPSHOT_TOKEN = ""
+
+
+@dataclass(frozen=True)
+class BBox:
+    left: float
+    top: float
+    width: float
+    height: float
 
 
 @dataclass(frozen=True)
@@ -58,6 +68,12 @@ class CaptureEvent:
     snapshot_at: str
     tracking_object_id: Optional[int]
     confidence: float
+    event_type: str
+    bbox: BBox
+    crop_bbox: BBox
+    image_width: int
+    image_height: int
+    received_monotonic: Optional[float]
     ai_result: Dict[str, Any]
 
 
@@ -65,6 +81,7 @@ class CaptureEvent:
 class CameraTarget:
     role: str
     cam_id: str
+    ai_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -72,6 +89,7 @@ class CameraGroup:
     group_id: str
     ai_camera_role: Optional[str]
     ai_cam_id: Optional[str]
+    ai_cam_ids: Tuple[str, ...]
     cameras: Tuple[CameraTarget, ...]
 
 
@@ -123,6 +141,13 @@ def coerce_int(value: Any) -> Optional[int]:
         return None
 
 
+def coerce_positive_int(value: Any) -> Optional[int]:
+    parsed = coerce_int(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
 def parse_iso_datetime(value: Any) -> Optional[datetime]:
     if value is None:
         return None
@@ -146,6 +171,16 @@ def event_age_sec(event: "CaptureEvent", *, now: Optional[datetime] = None) -> O
         return None
     now = now or datetime.now(timezone.utc)
     return (now - produced_at).total_seconds()
+
+
+def config_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def load_service_config(path: Optional[str]) -> ServiceConfig:
@@ -187,8 +222,10 @@ def load_service_config(path: Optional[str]) -> ServiceConfig:
             seen_roles.add(role_text)
 
             cam_id = ""
+            ai_enabled = False
             if isinstance(cam_cfg, dict):
                 cam_id = str(cam_cfg.get("cam_id") or "").strip()
+                ai_enabled = config_bool(cam_cfg.get("ai"))
             elif cam_cfg is not None:
                 cam_id = str(cam_cfg).strip()
             if cam_id:
@@ -198,27 +235,35 @@ def load_service_config(path: Optional[str]) -> ServiceConfig:
                         f"camera {cam_id!r} is configured in multiple groups: {owner!r} and {group_id_text!r}"
                     )
                 seen_cam_ids[cam_id] = group_id_text
-                targets.append(CameraTarget(role=role_text, cam_id=cam_id))
+                targets.append(CameraTarget(role=role_text, cam_id=cam_id, ai_enabled=ai_enabled))
 
         ai_role = str(group_cfg.get("ai_camera") or "").strip() or None
         ai_cam_id = ""
         if ai_role:
+            updated_targets: List[CameraTarget] = []
             for target in targets:
                 if target.role == ai_role:
                     ai_cam_id = target.cam_id
-                    break
+                    updated_targets.append(
+                        CameraTarget(role=target.role, cam_id=target.cam_id, ai_enabled=True)
+                    )
+                else:
+                    updated_targets.append(target)
+            targets = updated_targets
         if ai_role and not ai_cam_id:
             raise ValueError(
                 f"camera group {group_id!r} ai_camera={ai_role!r} has no cam_id"
             )
         if not targets:
             raise ValueError(f"camera group {group_id!r} must contain at least one camera")
+        ai_cam_ids = tuple(target.cam_id for target in targets if target.ai_enabled)
 
         groups.append(
             CameraGroup(
                 group_id=group_id_text,
                 ai_camera_role=ai_role,
                 ai_cam_id=ai_cam_id or None,
+                ai_cam_ids=ai_cam_ids,
                 cameras=tuple(targets),
             )
         )
@@ -235,15 +280,105 @@ def plate_from_ai_result(result: Dict[str, Any]) -> str:
     return ""
 
 
+def parse_bbox(value: Any) -> Optional[BBox]:
+    if isinstance(value, dict):
+        left = coerce_float(value.get("left"), 0.0)
+        top = coerce_float(value.get("top"), 0.0)
+        width = coerce_float(value.get("width"), 0.0)
+        height = coerce_float(value.get("height"), 0.0)
+    elif isinstance(value, (list, tuple)) and len(value) >= 4:
+        x1 = coerce_float(value[0], 0.0)
+        y1 = coerce_float(value[1], 0.0)
+        x2 = coerce_float(value[2], 0.0)
+        y2 = coerce_float(value[3], 0.0)
+        left = x1
+        top = y1
+        width = x2 - x1
+        height = y2 - y1
+    else:
+        return None
+
+    if width <= 1.0 or height <= 1.0:
+        return None
+    return BBox(left=left, top=top, width=width, height=height)
+
+
+def expand_bbox_to_frame(
+    bbox: BBox,
+    *,
+    image_width: int,
+    image_height: int,
+    expand_ratio: float = DEFAULT_CROP_EXPAND_RATIO,
+) -> Optional[BBox]:
+    if image_width <= 0 or image_height <= 0:
+        return None
+
+    ratio = max(0.0, float(expand_ratio))
+    grow_w = bbox.width * ratio
+    grow_h = bbox.height * ratio
+    left = max(0.0, bbox.left - grow_w / 2.0)
+    top = max(0.0, bbox.top - grow_h / 2.0)
+    right = min(float(image_width), bbox.left + bbox.width + grow_w / 2.0)
+    bottom = min(float(image_height), bbox.top + bbox.height + grow_h / 2.0)
+    width = right - left
+    height = bottom - top
+    if width <= 1.0 or height <= 1.0:
+        return None
+    return BBox(left=left, top=top, width=width, height=height)
+
+
+def bbox_to_query_params(bbox: BBox) -> Dict[str, int]:
+    return {
+        "crop_left": int(round(bbox.left)),
+        "crop_top": int(round(bbox.top)),
+        "crop_width": max(1, int(round(bbox.width))),
+        "crop_height": max(1, int(round(bbox.height))),
+    }
+
+
+def bbox_to_normalized_query_params(
+    bbox: BBox,
+    *,
+    image_width: int,
+    image_height: int,
+) -> Dict[str, str]:
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("image dimensions must be positive")
+    return {
+        "crop_left_norm": f"{bbox.left / float(image_width):.8f}",
+        "crop_top_norm": f"{bbox.top / float(image_height):.8f}",
+        "crop_width_norm": f"{bbox.width / float(image_width):.8f}",
+        "crop_height_norm": f"{bbox.height / float(image_height):.8f}",
+    }
+
+
+def bbox_to_metadata(bbox: BBox) -> Dict[str, float]:
+    return {
+        "left": float(bbox.left),
+        "top": float(bbox.top),
+        "width": float(bbox.width),
+        "height": float(bbox.height),
+    }
+
+
 def iter_capture_events(
     payload: Dict[str, Any],
     *,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     allow_missing_plate: bool = False,
     vehicle_types: Tuple[str, ...] = DEFAULT_VEHICLE_TYPES,
+    crop_expand_ratio: float = DEFAULT_CROP_EXPAND_RATIO,
+    received_monotonic: Optional[float] = None,
 ) -> Iterable[CaptureEvent]:
     ai_results = payload.get("ai_results")
     if not isinstance(ai_results, list):
+        return
+
+    image = payload.get("image") if isinstance(payload.get("image"), dict) else {}
+    image_width = coerce_positive_int(image.get("width") or image.get("image_width"))
+    image_height = coerce_positive_int(image.get("height") or image.get("image_height"))
+    if image_width is None or image_height is None:
+        logging.debug("Skipping payload without image dimensions message_id=%s", payload.get("message_id"))
         return
 
     trigger_cam_id = str(payload.get("cam_id") or "")
@@ -259,12 +394,27 @@ def iter_capture_events(
         if str(result.get("meta_type") or "").strip().lower() not in vehicle_types:
             continue
 
+        event_type = str(result.get("event_type") or "").strip().lower()
+        if event_type not in CAPTURE_EVENT_TYPES:
+            continue
+
         confidence = coerce_float(result.get("confidence"), 0.0)
         if confidence < float(confidence_threshold):
             continue
 
         plate = plate_from_ai_result(result)
         tracking_object_id = coerce_int(result.get("tracking_object_id"))
+        bbox = parse_bbox(result.get("bbox"))
+        if bbox is None:
+            continue
+        crop_bbox = expand_bbox_to_frame(
+            bbox,
+            image_width=image_width,
+            image_height=image_height,
+            expand_ratio=crop_expand_ratio,
+        )
+        if crop_bbox is None:
+            continue
 
         if not plate and allow_missing_plate:
             fallback_id = tracking_object_id if tracking_object_id is not None else result.get("id", "unknown")
@@ -286,6 +436,12 @@ def iter_capture_events(
             snapshot_at=str(produced_at) if produced_at is not None else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             tracking_object_id=tracking_object_id,
             confidence=confidence,
+            event_type=event_type,
+            bbox=bbox,
+            crop_bbox=crop_bbox,
+            image_width=image_width,
+            image_height=image_height,
+            received_monotonic=received_monotonic,
             ai_result=dict(result),
         )
 
@@ -334,6 +490,9 @@ def build_snapshot_url(
     device_id: str,
     at_time: Optional[str],
     token: str,
+    crop_bbox: Optional[BBox] = None,
+    image_width: Optional[int] = None,
+    image_height: Optional[int] = None,
 ) -> str:
     params = {
         "device_id": device_id,
@@ -341,6 +500,17 @@ def build_snapshot_url(
     }
     if at_time:
         params["at_time"] = at_time
+    if crop_bbox is not None:
+        if image_width is None or image_height is None:
+            params.update(bbox_to_query_params(crop_bbox))
+        else:
+            params.update(
+                bbox_to_normalized_query_params(
+                    crop_bbox,
+                    image_width=image_width,
+                    image_height=image_height,
+                )
+            )
     return f"{base_url}?{urlencode(params)}"
 
 
@@ -352,11 +522,13 @@ def redact_secret(text: Any, secret: str) -> str:
 
 
 def snapshot_filename(event: CaptureEvent, *, role: str = "snapshot") -> str:
-    ts = sanitize_timestamp(event.snapshot_at or event.produced_at or time.strftime("%Y-%m-%dT%H-%M-%S", time.gmtime()))
-    plate = safe_folder_name(event.plate)
+    return f"{snapshot_stem(event, role=role)}.jpg"
+
+
+def snapshot_stem(event: CaptureEvent, *, role: str = "snapshot") -> str:
     cam = normalize_plate(event.capture_cam_id) or "CAM"
     capture_role = safe_folder_name(event.capture_role or role)
-    return f"{capture_role}_{plate}_{cam}_{ts}.jpg"
+    return f"{capture_role}_{cam}"
 
 
 class SnapshotClient:
@@ -384,6 +556,60 @@ class SnapshotClient:
     def plate_dir(self, plate: str) -> Path:
         return self.output_root / safe_folder_name(plate)
 
+    def event_stem(self, event: CaptureEvent) -> str:
+        return snapshot_stem(event)
+
+    def capture_path(self, event: CaptureEvent) -> Path:
+        return self.plate_dir(event.plate) / snapshot_filename(event)
+
+    def metadata_path_for_image(self, image_path: Path) -> Path:
+        return image_path.with_suffix(".json")
+
+    def find_existing_record(self, event: CaptureEvent) -> Optional[Dict[str, Any]]:
+        stem = self.event_stem(event)
+        output_dir = self.plate_dir(event.plate)
+        candidate_metadata = [output_dir / f"{stem}.json"]
+        candidate_metadata.extend(sorted(output_dir.glob(f"{stem}_track*.json")))
+
+        best_record: Optional[Dict[str, Any]] = None
+        best_confidence = float("-inf")
+        for metadata_path in candidate_metadata:
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            file_path = Path(str(metadata.get("file") or metadata_path.with_suffix(".jpg")))
+            if file_path.is_file() and self.is_valid_image_file(file_path):
+                metadata["_metadata_path"] = str(metadata_path)
+                metadata["_file_path"] = str(file_path)
+                confidence = coerce_float(metadata.get("confidence"), float("-inf"))
+                if best_record is None or confidence > best_confidence:
+                    best_record = metadata
+                    best_confidence = confidence
+        if best_record is not None:
+            return best_record
+
+        candidate_images = [output_dir / f"{stem}.jpg"]
+        candidate_images.extend(sorted(output_dir.glob(f"{stem}_track*.jpg")))
+        for image_path in candidate_images:
+            if self.is_valid_image_file(image_path):
+                return {
+                    "file": str(image_path),
+                    "confidence": None,
+                    "_metadata_path": str(self.metadata_path_for_image(image_path)),
+                    "_file_path": str(image_path),
+                }
+        return None
+
+    def should_capture_event(self, event: CaptureEvent) -> bool:
+        existing = self.find_existing_record(event)
+        if existing is None:
+            return True
+        existing_confidence = existing.get("confidence")
+        if existing_confidence is None:
+            return False
+        return event.confidence > coerce_float(existing_confidence, 0.0)
+
     def real_images_in_plate_dir(self, plate: str) -> List[Path]:
         output_dir = self.plate_dir(plate)
         if not output_dir.is_dir():
@@ -407,6 +633,8 @@ class SnapshotClient:
         return True
 
     def has_existing_capture_for_event(self, event: CaptureEvent) -> bool:
+        if self.find_existing_record(event) is not None:
+            return True
         output_dir = self.plate_dir(event.plate)
         if not output_dir.is_dir():
             return False
@@ -454,8 +682,97 @@ class SnapshotClient:
             path.unlink(missing_ok=True)
             raise RuntimeError("snapshot response does not look like an image")
 
+    def write_capture_metadata(
+        self,
+        metadata_path: Path,
+        event: CaptureEvent,
+        output_path: Path,
+        *,
+        status: Any,
+        request_elapsed_ms: float,
+        total_latency_ms: Optional[float],
+        api_crop_elapsed_ms: Optional[float],
+    ) -> None:
+        metadata = {
+            "plate": safe_folder_name(event.plate),
+            "group_id": event.group_id,
+            "capture_role": event.capture_role,
+            "trigger_cam_id": event.trigger_cam_id,
+            "capture_cam_id": event.capture_cam_id,
+            "message_id": event.message_id,
+            "frame_num": event.frame_num,
+            "ntp_timestamp": event.ntp_timestamp,
+            "produced_at": event.produced_at,
+            "snapshot_at": event.snapshot_at,
+            "tracking_object_id": event.tracking_object_id,
+            "confidence": event.confidence,
+            "event_type": event.event_type,
+            "image_width": event.image_width,
+            "image_height": event.image_height,
+            "bbox": bbox_to_metadata(event.bbox),
+            "crop_bbox": bbox_to_metadata(event.crop_bbox),
+            "crop_bbox_norm": bbox_to_normalized_query_params(
+                event.crop_bbox,
+                image_width=event.image_width,
+                image_height=event.image_height,
+            ),
+            "file": str(output_path),
+            "status": status,
+            "request_elapsed_ms": request_elapsed_ms,
+            "total_latency_ms": total_latency_ms,
+            "api_crop_elapsed_ms": api_crop_elapsed_ms,
+            "saved_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        tmp_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(metadata, ensure_ascii=True, sort_keys=True, indent=2), encoding="utf-8")
+        os.replace(tmp_path, metadata_path)
+
+    def cleanup_replaced_record(self, existing_record: Optional[Dict[str, Any]], output_path: Path) -> None:
+        if not existing_record:
+            return
+        old_file_value = existing_record.get("_file_path") or existing_record.get("file")
+        old_metadata_value = existing_record.get("_metadata_path")
+        old_file = Path(str(old_file_value)) if old_file_value else None
+        old_metadata = Path(str(old_metadata_value)) if old_metadata_value else None
+        if old_file is not None and old_file != output_path:
+            try:
+                old_file.unlink(missing_ok=True)
+            except OSError as exc:
+                logging.warning("Failed to remove replaced snapshot %s: %s", old_file, exc)
+        if old_metadata is not None and old_metadata != self.metadata_path_for_image(output_path):
+            try:
+                old_metadata.unlink(missing_ok=True)
+            except OSError as exc:
+                logging.warning("Failed to remove replaced metadata %s: %s", old_metadata, exc)
+        for old_path in (old_file, old_metadata):
+            if old_path is None:
+                continue
+            parent = old_path.parent
+            if parent and parent != self.output_root and parent.is_dir():
+                try:
+                    parent.rmdir()
+                except OSError:
+                    pass
+
+    def cleanup_view_duplicates(self, event: CaptureEvent, output_path: Path, metadata_path: Path) -> None:
+        output_dir = self.plate_dir(event.plate)
+        if not output_dir.is_dir():
+            return
+        stem = self.event_stem(event)
+        duplicate_paths = list(output_dir.glob(f"{stem}_track*.jpg"))
+        duplicate_paths.extend(output_dir.glob(f"{stem}_track*.json"))
+        duplicate_paths.extend(path for path in (output_dir / f"{stem}.jpg", output_dir / f"{stem}.json"))
+        for path in duplicate_paths:
+            if path in {output_path, metadata_path}:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logging.warning("Failed to remove duplicate snapshot view file %s: %s", path, exc)
+
     def capture(self, event: CaptureEvent) -> Dict[str, Any]:
         output_dir = self.plate_dir(event.plate)
+        existing_record = self.find_existing_record(event)
 
         if not event.capture_cam_id:
             raise RuntimeError("Missing cam_id / device_id in message")
@@ -467,8 +784,12 @@ class SnapshotClient:
             device_id=event.capture_cam_id,
             at_time=event.snapshot_at if self.include_at_time else None,
             token=self.token,
+            crop_bbox=event.crop_bbox,
+            image_width=event.image_width,
+            image_height=event.image_height,
         )
-        output_path = output_dir / snapshot_filename(event)
+        output_path = self.capture_path(event)
+        metadata_path = self.metadata_path_for_image(output_path)
 
         if self.dry_run:
             logging.info("Dry-run snapshot url=%s output=%s", redact_secret(snapshot_url, self.token), output_path)
@@ -483,9 +804,13 @@ class SnapshotClient:
         for attempt in range(self.retries + 1):
             tmp_path: Optional[Path] = None
             try:
+                request_started = time.monotonic()
                 with self.session.get(snapshot_url, timeout=self.timeout_sec, stream=True) as response:
                     response.raise_for_status()
                     content_type = response.headers.get("Content-Type", "").lower()
+                    api_crop_elapsed_ms = coerce_float(response.headers.get("X-Crop-Duration-Ms"), -1.0)
+                    if api_crop_elapsed_ms < 0:
+                        api_crop_elapsed_ms = None
 
                     output_dir.mkdir(parents=True, exist_ok=True)
                     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
@@ -496,23 +821,44 @@ class SnapshotClient:
                                 f.write(chunk)
                     self.validate_image_file(tmp_path, content_type)
                     os.replace(tmp_path, output_path)
+                    request_elapsed_ms = (time.monotonic() - request_started) * 1000.0
+                    total_latency_ms = None
+                    if event.received_monotonic is not None:
+                        total_latency_ms = (time.monotonic() - event.received_monotonic) * 1000.0
+                    self.write_capture_metadata(
+                        metadata_path,
+                        event,
+                        output_path,
+                        status=response.status_code,
+                        request_elapsed_ms=request_elapsed_ms,
+                        total_latency_ms=total_latency_ms,
+                        api_crop_elapsed_ms=api_crop_elapsed_ms,
+                    )
+                    self.cleanup_replaced_record(existing_record, output_path)
+                    self.cleanup_view_duplicates(event, output_path, metadata_path)
 
                 logging.info(
-                    "Snapshot saved group=%s role=%s plate=%s trigger_cam=%s capture_cam=%s at_time=%s file=%s status=%s",
-                    event.
+                    "Snapshot saved group=%s role=%s plate=%s event_type=%s confidence=%.4f trigger_cam=%s capture_cam=%s at_time=%s file=%s status=%s request_ms=%.1f total_latency_ms=%s api_crop_ms=%s",
                     event.group_id,
                     event.capture_role,
                     event.plate,
+                    event.event_type,
+                    event.confidence,
                     event.trigger_cam_id,
                     event.capture_cam_id,
                     event.snapshot_at,
                     output_path,
                     response.status_code,
+                    request_elapsed_ms,
+                    f"{total_latency_ms:.1f}" if total_latency_ms is not None else "unknown",
+                    f"{api_crop_elapsed_ms:.1f}" if api_crop_elapsed_ms is not None else "unknown",
                 )
                 return {
                     "url": snapshot_url,
                     "file": str(output_path),
                     "status": response.status_code,
+                    "request_elapsed_ms": request_elapsed_ms,
+                    "total_latency_ms": total_latency_ms,
                 }
 
             except Exception as exc:
@@ -545,6 +891,7 @@ class VehicleCaptureProcessor:
         cooldown_sec: float = DEFAULT_COOLDOWN_SEC,
         allow_missing_plate: bool = False,
         max_event_age_sec: float = DEFAULT_MAX_EVENT_AGE_SEC,
+        crop_expand_ratio: float = DEFAULT_CROP_EXPAND_RATIO,
         service_config: Optional[ServiceConfig] = None,
         deduper: Optional[CooldownDeduper] = None,
     ):
@@ -552,11 +899,13 @@ class VehicleCaptureProcessor:
         self.confidence_threshold = float(confidence_threshold)
         self.allow_missing_plate = bool(allow_missing_plate)
         self.max_event_age_sec = max(0.0, float(max_event_age_sec))
+        self.crop_expand_ratio = max(0.0, float(crop_expand_ratio))
         self.service_config = service_config or ServiceConfig(camera_groups=())
         self.groups_by_trigger_cam: Dict[str, List[CameraGroup]] = {}
         for group in self.service_config.camera_groups:
-            if group.ai_cam_id:
-                self.groups_by_trigger_cam.setdefault(group.ai_cam_id, []).append(group)
+            if group.ai_cam_ids:
+                for ai_cam_id in group.ai_cam_ids:
+                    self.groups_by_trigger_cam.setdefault(ai_cam_id, []).append(group)
             else:
                 for target in group.cameras:
                     self.groups_by_trigger_cam.setdefault(target.cam_id, []).append(group)
@@ -572,7 +921,18 @@ class VehicleCaptureProcessor:
 
         expanded: List[CaptureEvent] = []
         for group in groups:
-            for target in group.cameras:
+            if group.ai_cam_ids:
+                targets = [
+                    target
+                    for target in group.cameras
+                    if target.ai_enabled and target.cam_id == event.trigger_cam_id
+                ]
+            elif group.ai_cam_id:
+                targets = [target for target in group.cameras if target.cam_id == event.trigger_cam_id]
+            else:
+                targets = list(group.cameras)
+
+            for target in targets:
                 expanded.append(
                     CaptureEvent(
                         plate=event.plate,
@@ -587,17 +947,30 @@ class VehicleCaptureProcessor:
                         snapshot_at=event.snapshot_at,
                         tracking_object_id=event.tracking_object_id,
                         confidence=event.confidence,
+                        event_type=event.event_type,
+                        bbox=event.bbox,
+                        crop_bbox=event.crop_bbox,
+                        image_width=event.image_width,
+                        image_height=event.image_height,
+                        received_monotonic=event.received_monotonic,
                         ai_result=event.ai_result,
                     )
                 )
         return expanded
 
-    def process_payload(self, payload: Dict[str, Any]) -> List[CaptureEvent]:
+    def process_payload(
+        self,
+        payload: Dict[str, Any],
+        *,
+        received_monotonic: Optional[float] = None,
+    ) -> List[CaptureEvent]:
         processed: List[CaptureEvent] = []
         for event in iter_capture_events(
             payload,
             confidence_threshold=self.confidence_threshold,
             allow_missing_plate=self.allow_missing_plate,
+            crop_expand_ratio=self.crop_expand_ratio,
+            received_monotonic=received_monotonic,
         ):
             groups = self.groups_by_trigger_cam.get(event.trigger_cam_id)
             if self.service_config.camera_groups and not groups:
@@ -624,29 +997,42 @@ class VehicleCaptureProcessor:
             if not capture_events:
                 continue
 
-            required_images = len(capture_events)
-            missing_events = [
+            has_any_existing_image = any(
+                self.snapshot_client.has_existing_capture_for_event(capture_event)
+                for capture_event in capture_events
+            )
+            if event.event_type == "object_exist" and has_any_existing_image:
+                logging.debug(
+                    "Skipping object_exist because image already exists plate=%s tracking_object_id=%s",
+                    event.plate,
+                    event.tracking_object_id,
+                )
+                continue
+
+            candidate_events = [
                 capture_event
                 for capture_event in capture_events
-                if not self.snapshot_client.has_existing_capture_for_event(capture_event)
+                if self.snapshot_client.should_capture_event(capture_event)
             ]
-            if not missing_events:
+            if not candidate_events:
                 if not self.deduper.in_cooldown(dedupe_cam, event.plate):
                     logging.info(
-                        "Skipping existing capture plate=%s required_images=%d existing_images=%d",
+                        "Skipping capture plate=%s event_type=%s tracking_object_id=%s existing_images=%d confidence=%.4f",
                         event.plate,
-                        required_images,
+                        event.event_type,
+                        event.tracking_object_id,
                         len(self.snapshot_client.real_images_in_plate_dir(event.plate)),
+                        event.confidence,
                     )
                     self.deduper.mark_processed(dedupe_cam, event.plate)
                 continue
 
-            if self.deduper.in_cooldown(dedupe_cam, event.plate) and len(missing_events) == required_images:
+            if event.event_type == "object_exist" and self.deduper.in_cooldown(dedupe_cam, event.plate):
                 logging.debug("Skipping cooldown key=%s plate=%s", dedupe_cam, event.plate)
                 continue
 
             success_count = 0
-            for capture_event in missing_events:
+            for capture_event in candidate_events:
                 try:
                     self.snapshot_client.capture(capture_event)
                     processed.append(capture_event)
@@ -662,7 +1048,7 @@ class VehicleCaptureProcessor:
                         capture_event.snapshot_at,
                         exc,
                     )
-            if success_count == len(missing_events):
+            if success_count == len(candidate_events):
                 self.deduper.mark_processed(dedupe_cam, event.plate)
 
         return processed
@@ -675,6 +1061,7 @@ def process_kafka_message(
     *,
     commit_offsets: bool = True,
 ) -> List[CaptureEvent]:
+    received_monotonic = time.monotonic()
     payload = decode_message_value(message.value())
     if payload is None:
         if commit_offsets:
@@ -684,7 +1071,7 @@ def process_kafka_message(
                 logging.warning("Kafka commit failed for invalid message: %s", exc)
         return []
 
-    events = processor.process_payload(payload)
+    events = processor.process_payload(payload, received_monotonic=received_monotonic)
     if commit_offsets:
         try:
             consumer.commit(message=message, asynchronous=False)
@@ -703,6 +1090,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offset", choices=("earliest", "latest"), default="latest")
     parser.add_argument("--poll-timeout", type=float, default=DEFAULT_POLL_TIMEOUT_SEC)
     parser.add_argument("--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD)
+    parser.add_argument(
+        "--crop-expand-ratio",
+        type=float,
+        default=DEFAULT_CROP_EXPAND_RATIO,
+        help="Expand the vehicle bbox by this ratio before sending crop params to the snapshot API.",
+    )
     parser.add_argument("--cooldown-sec", type=float, default=DEFAULT_COOLDOWN_SEC)
     parser.add_argument(
         "--max-event-age-sec",
@@ -753,6 +1146,7 @@ def run_consumer(args: argparse.Namespace) -> int:
         confidence_threshold=args.confidence_threshold,
         cooldown_sec=args.cooldown_sec,
         max_event_age_sec=args.max_event_age_sec,
+        crop_expand_ratio=args.crop_expand_ratio,
         allow_missing_plate=args.allow_missing_plate,
         service_config=service_config,
     )
@@ -860,6 +1254,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-

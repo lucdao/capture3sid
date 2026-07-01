@@ -1,4 +1,45 @@
 services:
+  snapshot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: snapshot-api
+    restart: unless-stopped
+    command:
+      - python
+      - snapshot_api.py
+      - --config
+      - /app/camera_groups.yaml
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8888"
+      - --snapshot-token
+      - ${SNAPSHOT_TOKEN:-}
+      - --frame-stale-sec
+      - ${FRAME_STALE_SEC:-5}
+      - --reconnect-delay-sec
+      - ${RECONNECT_DELAY_SEC:-1}
+      - --jpeg-quality
+      - ${JPEG_QUALITY:-90}
+      - --log-level
+      - ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./camera_groups.yaml:/app/camera_groups.yaml:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - shared_network
+      - ivista_client_webapp_network
+
   vehicle-capture-service:
     build:
       context: .
@@ -20,6 +61,8 @@ services:
       - ${KAFKA_OFFSET:-latest}
       - --confidence-threshold
       - ${CONFIDENCE_THRESHOLD:-0.99}
+      - --crop-expand-ratio
+      - ${CROP_EXPAND_RATIO:-0.30}
       - --cooldown-sec
       - ${COOLDOWN_SEC:-60}
       - --max-event-age-sec
@@ -27,7 +70,7 @@ services:
       - --output-root
       - /data/vehicle_captures
       - --snapshot-base-url
-      - ${SNAPSHOT_BASE_URL:-http://192.168.1.199:9999/snapshot_rtsp}
+      - ${SNAPSHOT_BASE_URL:-http://snapshot-api:8888/snapshot_rtsp}
       - --snapshot-token
       - ${SNAPSHOT_TOKEN:-}
       - --request-timeout-sec
@@ -39,6 +82,8 @@ services:
     volumes:
       - ./camera_groups.yaml:/app/camera_groups.yaml:ro
       - ./server_assets/vehicle_captures:/data/vehicle_captures
+    depends_on:
+      - snapshot-api
     healthcheck:
       test:
         - CMD
@@ -49,3 +94,14 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+    networks:
+      - shared_network
+
+networks:
+  shared_network:
+    external: true
+    name: shared_network
+  ivista_client_webapp_network:
+    external: true
+    name: ivista-client-webapp_default
