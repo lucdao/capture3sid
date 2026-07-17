@@ -1,5 +1,7 @@
 import argparse
 import os
+from urllib.parse import urljoin
+
 import requests
 
 BASE_URL = "http://192.168.1.199:8011"
@@ -57,7 +59,7 @@ def get_preview_url(asset_id, base_url=BASE_URL, token=""):
             "Set STORAGE_MANAGE_TOKEN or pass --token."
         )
     r.raise_for_status()
-    return r.json()["access_url"]
+    return urljoin(f"{base_url.rstrip('/')}/", r.json()["access_url"])
 
 
 if __name__ == "__main__":
@@ -85,5 +87,3 @@ if __name__ == "__main__":
     print("timestamp:", asset["timestamp"])
 
     print("preview URL:", get_preview_url(asset["id"], base_url=args.base_url, token=args.token))
-
-

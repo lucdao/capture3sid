@@ -8,8 +8,6 @@ services:
     command:
       - python
       - snapshot_api.py
-      - --config
-      - /app/camera_groups.yaml
       - --host
       - 0.0.0.0
       - --port
@@ -24,8 +22,13 @@ services:
       - ${JPEG_QUALITY:-90}
       - --log-level
       - ${LOG_LEVEL:-INFO}
-    volumes:
-      - ./camera_groups.yaml:/app/camera_groups.yaml:ro
+    environment:
+      CAMERA_API_BASE_URL: ${CAMERA_API_BASE_URL:-http://10.11.12.12:8101}
+      CAMERA_API_AUTHORIZATION: ${CAMERA_API_AUTHORIZATION:?CAMERA_API_AUTHORIZATION is required}
+      CAMERA_API_TIMEOUT_SEC: ${CAMERA_API_TIMEOUT_SEC:-5}
+      CAMERA_CONFIG_RELOAD_INTERVAL_SEC: ${CAMERA_CONFIG_RELOAD_INTERVAL_SEC:-30}
+      RELAY_BASE_URL: ${RELAY_BASE_URL:-rtsp://admin:ivista@mediamtx:8554}
+      DEFAULT_STREAM_PROFILE: ${DEFAULT_STREAM_PROFILE:-main}
     healthcheck:
       test:
         - CMD
@@ -49,8 +52,6 @@ services:
     command:
       - python
       - snapshot.py
-      - --config
-      - /app/camera_groups.yaml
       - --broker
       - ${KAFKA_BROKER:-192.168.1.199:9092}
       - --topic
@@ -63,12 +64,16 @@ services:
       - ${CONFIDENCE_THRESHOLD:-0.99}
       - --crop-expand-ratio
       - ${CROP_EXPAND_RATIO:-0.30}
+      - --plate-crop-expand-ratio
+      - ${PLATE_CROP_EXPAND_RATIO:-0.0}
       - --cooldown-sec
       - ${COOLDOWN_SEC:-60}
       - --max-event-age-sec
       - ${MAX_EVENT_AGE_SEC:-120}
       - --output-root
       - /data/vehicle_captures
+      - --storage-timezone
+      - ${STORAGE_TIMEZONE:-Asia/Ho_Chi_Minh}
       - --snapshot-base-url
       - ${SNAPSHOT_BASE_URL:-http://snapshot-api:8888/snapshot_rtsp}
       - --snapshot-token
@@ -77,11 +82,26 @@ services:
       - ${REQUEST_TIMEOUT_SEC:-3}
       - --retries
       - ${SNAPSHOT_RETRIES:-1}
+      - --storage-manage-base-url
+      - ${STORAGE_MANAGE_BASE_URL:-http://192.168.1.199:8011}
+      - --storage-manage-token
+      - ${STORAGE_MANAGE_TOKEN:-}
+      - --storage-asset-retries
+      - ${STORAGE_ASSET_RETRIES:-5}
+      - --storage-asset-retry-delay-sec
+      - ${STORAGE_ASSET_RETRY_DELAY_SEC:-0.5}
       - --log-level
       - ${LOG_LEVEL:-INFO}
     volumes:
-      - ./camera_groups.yaml:/app/camera_groups.yaml:ro
       - ./server_assets/vehicle_captures:/data/vehicle_captures
+    environment:
+      CAMERA_API_BASE_URL: ${CAMERA_API_BASE_URL:-http://10.11.12.12:8101}
+      CAMERA_API_AUTHORIZATION: ${CAMERA_API_AUTHORIZATION:?CAMERA_API_AUTHORIZATION is required}
+      CAMERA_API_TIMEOUT_SEC: ${CAMERA_API_TIMEOUT_SEC:-5}
+      CAMERA_CONFIG_RELOAD_INTERVAL_SEC: ${CAMERA_CONFIG_RELOAD_INTERVAL_SEC:-30}
+      SHARPEN_PLATE_IMAGE: ${SHARPEN_PLATE_IMAGE:-false}
+      PLATE_SHARPEN_AMOUNT: ${PLATE_SHARPEN_AMOUNT:-5.0}
+      PLATE_SHARPEN_BLUR_KERNEL: ${PLATE_SHARPEN_BLUR_KERNEL:-3}
     depends_on:
       - snapshot-api
     healthcheck:
@@ -95,6 +115,51 @@ services:
       retries: 3
       start_period: 20s
 
+    networks:
+      - shared_network
+
+  capture-sync-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: capture-sync-api
+    restart: unless-stopped
+    command:
+      - python
+      - capture_sync_api.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8890"
+      - --output-root
+      - /data/vehicle_captures
+      - --sync-token
+      - ${SYNC_TOKEN:-}
+      - --submit-token
+      - ${SUBMIT_TOKEN:-}
+      - --storage-timezone
+      - ${STORAGE_TIMEZONE:-Asia/Ho_Chi_Minh}
+      - --log-level
+      - ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./server_assets/vehicle_captures:/data/vehicle_captures
+    environment:
+      CAMERA_API_BASE_URL: ${CAMERA_API_BASE_URL:-http://10.11.12.12:8101}
+      CAMERA_API_AUTHORIZATION: ${CAMERA_API_AUTHORIZATION:?CAMERA_API_AUTHORIZATION is required}
+      CAMERA_API_TIMEOUT_SEC: ${CAMERA_API_TIMEOUT_SEC:-5}
+      CAMERA_CONFIG_RELOAD_INTERVAL_SEC: ${CAMERA_CONFIG_RELOAD_INTERVAL_SEC:-30}
+    ports:
+      - "${SYNC_API_PORT:-8890}:8890"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8890/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     networks:
       - shared_network
 

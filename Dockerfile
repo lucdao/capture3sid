@@ -14,8 +14,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY snapshot.py .
 COPY snapshot_api.py .
-COPY camera_groups.yaml .
+COPY capture_sync_api.py .
+COPY camera_config_store.py .
 
-RUN mkdir -p /data/vehicle_captures
+RUN mkdir -p /data/vehicle_captures /data/config
 
 CMD ["python", "snapshot.py"]

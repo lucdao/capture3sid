@@ -6,12 +6,17 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
+
+from camera_config_store import (
+    InspectionCameraConfigProvider,
+    DEFAULT_CONFIG_RELOAD_INTERVAL_SEC,
+)
 
 
 DEFAULT_HOST = "0.0.0.0"
@@ -103,9 +108,22 @@ def _url_join(base_url: str, path: str) -> str:
 def _default_stream_path(cam_id: str, profile: str) -> str:
     return "/".join(
         quote(part, safe="")
-        for part in (str(cam_id).strip(), str(profile).strip())
+        for part in ("live", str(cam_id).strip(), str(profile).strip())
         if part
     )
+
+
+def iter_camera_role_configs(role: Any, cam_cfg: Any) -> Iterable[Tuple[str, Any]]:
+    role_text = str(role).strip()
+    if isinstance(cam_cfg, list):
+        for item in cam_cfg:
+            yield role_text, item
+        return
+    if isinstance(cam_cfg, dict) and "cam_ids" in cam_cfg:
+        for cam_id in cam_cfg.get("cam_ids") or []:
+            yield role_text, {"cam_id": cam_id}
+        return
+    yield role_text, cam_cfg
 
 
 def config_bool(value: Any) -> bool:
@@ -118,15 +136,12 @@ def config_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def load_camera_stream_configs(
-    path: str,
+def load_camera_stream_configs_from_config(
+    raw: Dict[str, Any],
     *,
     relay_base_url: Optional[str] = None,
     default_stream_profile: Optional[str] = None,
 ) -> Dict[str, CameraStreamConfig]:
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
-
     relay_base = str(
         relay_base_url
         or raw.get("relay_base_url")
@@ -151,36 +166,48 @@ def load_camera_stream_configs(
         cameras = group_cfg.get("cameras") or {}
         if not isinstance(cameras, dict):
             continue
-        has_ai_markers = any(
-            isinstance(cam_cfg, dict) and config_bool(cam_cfg.get("ai"))
-            for cam_cfg in cameras.values()
-        )
         for role, cam_cfg in cameras.items():
-            cam_id = ""
-            stream_path = ""
-            profile = default_profile
-            if isinstance(cam_cfg, dict):
-                if has_ai_markers and not config_bool(cam_cfg.get("ai")):
+            for role_text, camera_cfg in iter_camera_role_configs(role, cam_cfg):
+                cam_id = ""
+                stream_path = ""
+                profile = default_profile
+                if isinstance(camera_cfg, dict):
+                    if role_text.strip().lower() == "mobile" or config_bool(camera_cfg.get("stream")) is False and "stream" in camera_cfg:
+                        continue
+                    cam_id = str(camera_cfg.get("cam_id") or "").strip()
+                    stream_path = str(camera_cfg.get("stream_path") or "").strip()
+                    profile = str(camera_cfg.get("stream_profile") or profile).strip() or default_profile
+                elif camera_cfg is not None:
+                    cam_id = str(camera_cfg).strip()
+                if not cam_id:
                     continue
-                cam_id = str(cam_cfg.get("cam_id") or "").strip()
-                stream_path = str(cam_cfg.get("stream_path") or "").strip()
-                profile = str(cam_cfg.get("stream_profile") or profile).strip() or default_profile
-            elif cam_cfg is not None:
-                cam_id = str(cam_cfg).strip()
-            if not cam_id:
-                continue
-            path_part = stream_path or _default_stream_path(cam_id, profile)
-            configs[cam_id] = CameraStreamConfig(
-                cam_id=cam_id,
-                role=str(role),
-                group_id=str(group_id),
-                stream_url=_url_join(relay_base, path_part),
-                stream_profile=profile,
-            )
+                path_part = stream_path or _default_stream_path(cam_id, profile)
+                configs[cam_id] = CameraStreamConfig(
+                    cam_id=cam_id,
+                    role=role_text,
+                    group_id=str(group_id),
+                    stream_url=_url_join(relay_base, path_part),
+                    stream_profile=profile,
+                )
 
     if not configs:
         raise ValueError("no camera streams configured")
     return configs
+
+
+def load_camera_stream_configs(
+    path: str,
+    *,
+    relay_base_url: Optional[str] = None,
+    default_stream_profile: Optional[str] = None,
+) -> Dict[str, CameraStreamConfig]:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    return load_camera_stream_configs_from_config(
+        raw,
+        relay_base_url=relay_base_url,
+        default_stream_profile=default_stream_profile,
+    )
 
 
 class StreamReader:
@@ -292,22 +319,53 @@ class SnapshotService:
         jpeg_quality: int = DEFAULT_JPEG_QUALITY,
         frame_stale_sec: float = DEFAULT_FRAME_STALE_SEC,
         reconnect_delay_sec: float = DEFAULT_RECONNECT_DELAY_SEC,
+        config_provider: Optional[InspectionCameraConfigProvider] = None,
+        relay_base_url: Optional[str] = None,
+        default_stream_profile: Optional[str] = None,
+        reload_interval_sec: float = DEFAULT_CONFIG_RELOAD_INTERVAL_SEC,
     ):
         self.token = str(token or "")
         self.jpeg_quality = min(100, max(1, int(jpeg_quality)))
         self.frame_stale_sec = max(0.1, float(frame_stale_sec))
-        self.readers = {
-            cam_id: StreamReader(config, reconnect_delay_sec=reconnect_delay_sec)
-            for cam_id, config in camera_configs.items()
-        }
+        self.camera_configs = dict(camera_configs)
+        self.reconnect_delay_sec = reconnect_delay_sec
+        self.config_provider = config_provider
+        self.relay_base_url = relay_base_url
+        self.default_stream_profile = default_stream_profile
+        self.reload_interval_sec = max(0.1, float(reload_interval_sec))
+        self._last_reload_check = 0.0
+        self._config_version = config_provider.current_version() if config_provider else None
+        self._config_lock = threading.Lock()
 
     def start(self) -> None:
-        for reader in self.readers.values():
-            reader.start()
+        logging.info("Snapshot API using on-demand camera capture for %d streams", len(self.camera_configs))
 
     def stop(self) -> None:
-        for reader in self.readers.values():
-            reader.stop()
+        return None
+
+    def reload_config_if_needed(self, *, force: bool = False) -> None:
+        if self.config_provider is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_reload_check < self.reload_interval_sec:
+            return
+        self._last_reload_check = now
+        try:
+            state = self.config_provider.load()
+            if not force and state.version == self._config_version:
+                return
+            configs = load_camera_stream_configs_from_config(
+                state.config,
+                relay_base_url=self.relay_base_url,
+                default_stream_profile=self.default_stream_profile,
+            )
+        except Exception as exc:
+            logging.warning("Failed to reload camera config for snapshot API: %s", exc)
+            return
+        with self._config_lock:
+            self.camera_configs = dict(configs)
+            self._config_version = state.version
+        logging.info("Reloaded snapshot camera config version=%s streams=%d", state.version, len(configs))
 
     def snapshot(
         self,
@@ -322,20 +380,31 @@ class SnapshotService:
         if self.token and token != self.token:
             raise HTTPException(status_code=401, detail="invalid token")
 
-        reader = self.readers.get(str(device_id))
-        if reader is None:
+        self.reload_config_if_needed()
+        with self._config_lock:
+            config = self.camera_configs.get(str(device_id))
+        if config is None:
             raise HTTPException(status_code=404, detail="unknown device_id")
 
         request_started = time.monotonic()
-        frame, frame_time, frame_shape = reader.snapshot()
-        if frame is None or frame_time is None or frame_shape is None:
-            raise HTTPException(status_code=503, detail="stream has no decoded frame yet")
+        try:
+            import cv2
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"opencv import failed: {exc}")
 
-        frame_age_ms = (time.monotonic() - frame_time) * 1000.0
-        if frame_age_ms > self.frame_stale_sec * 1000.0:
-            raise HTTPException(status_code=503, detail="latest frame is stale")
+        cap = cv2.VideoCapture(config.stream_url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        try:
+            if not cap.isOpened():
+                raise HTTPException(status_code=503, detail="camera stream did not open")
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise HTTPException(status_code=503, detail="failed to read camera frame")
+        finally:
+            cap.release()
 
-        frame_width, frame_height = frame_shape
+        frame_height, frame_width = frame.shape[:2]
+        frame_age_ms = 0.0
         try:
             crop = normalized_crop_to_pixels(
                 frame_width=frame_width,
@@ -350,8 +419,6 @@ class SnapshotService:
 
         crop_started = time.monotonic()
         crop_frame = frame[crop.top : crop.top + crop.height, crop.left : crop.left + crop.width]
-
-        import cv2
 
         ok, encoded = cv2.imencode(
             ".jpg",
@@ -378,14 +445,28 @@ class SnapshotService:
         return encoded.tobytes(), headers
 
     def health(self) -> Dict[str, Any]:
-        statuses = {cam_id: reader.status() for cam_id, reader in self.readers.items()}
-        healthy = any(status["has_frame"] for status in statuses.values())
-        return {"status": "ok" if healthy else "warming", "streams": statuses}
+        self.reload_config_if_needed()
+        with self._config_lock:
+            statuses = {
+                cam_id: {
+                    "cam_id": config.cam_id,
+                    "role": config.role,
+                    "group_id": config.group_id,
+                    "stream_url": config.stream_url,
+                    "stream_profile": config.stream_profile,
+                    "mode": "on_demand",
+                }
+                for cam_id, config in self.camera_configs.items()
+            }
+            version = self._config_version
+        return {"status": "ok", "config_version": version, "streams": statuses}
 
 
 def create_app(args: argparse.Namespace) -> FastAPI:
-    configs = load_camera_stream_configs(
-        args.config,
+    provider = InspectionCameraConfigProvider()
+    state = provider.load(force=True)
+    configs = load_camera_stream_configs_from_config(
+        state.config,
         relay_base_url=args.relay_base_url,
         default_stream_profile=args.default_stream_profile,
     )
@@ -395,6 +476,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         jpeg_quality=args.jpeg_quality,
         frame_stale_sec=args.frame_stale_sec,
         reconnect_delay_sec=args.reconnect_delay_sec,
+        config_provider=provider,
+        relay_base_url=args.relay_base_url,
+        default_stream_profile=args.default_stream_profile,
+        reload_interval_sec=args.config_reload_interval_sec,
     )
 
     app = FastAPI(title="Low-latency snapshot API")
@@ -440,7 +525,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Warm relay streams and serve low-latency cropped snapshots.")
-    parser.add_argument("--config", default="camera_groups.yaml")
+    parser.add_argument("--config-reload-interval-sec", type=float, default=float(os.environ.get("CAMERA_CONFIG_RELOAD_INTERVAL_SEC", DEFAULT_CONFIG_RELOAD_INTERVAL_SEC)))
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--relay-base-url", default=os.environ.get("RELAY_BASE_URL", ""))
@@ -464,7 +549,15 @@ def main() -> int:
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level=str(args.log_level).lower())
+    # Snapshot authentication is passed as a query parameter for compatibility;
+    # disable access logs so the token is never written to container logs.
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=str(args.log_level).lower(),
+        access_log=False,
+    )
     return 0
 
 
