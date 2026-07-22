@@ -119,6 +119,7 @@ class CaptureEvent:
     image_width: int
     image_height: int
     received_monotonic: Optional[float]
+    source_asset_id: Optional[str]
     source_file_name: Optional[str]
     ai_result: Dict[str, Any]
     placeholder: Dict[str, Any]
@@ -592,43 +593,6 @@ def optional_text(value: Any) -> Optional[str]:
     return text or None
 
 
-def storage_file_path_candidates(file_path: str) -> List[str]:
-    raw = str(file_path or "").strip()
-    if not raw:
-        return []
-    normalized = raw.replace("\\", "/").lstrip("./")
-    candidates = [raw, normalized]
-
-    marker_rewrites = (
-        "server_assets/V3SStorage/images/",
-        "server_assets/v3sstorage/images/",
-        "V3SStorage/images/",
-        "v3sstorage/images/",
-        "images/",
-    )
-    lowered = normalized.lower()
-    for marker in marker_rewrites:
-        marker_lower = marker.lower()
-        idx = lowered.find(marker_lower)
-        if idx >= 0:
-            tail = normalized[idx + len(marker):]
-            parts = tail.split("/")
-            if len(parts) >= 5:
-                year, month, day, cam_id = parts[:4]
-                filename = "/".join(parts[4:])
-                candidates.append(f"snapshot/{cam_id}/{year}/{month}/{day}/{filename}")
-            candidates.append(f"snapshot/{tail}")
-
-    unique: List[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        candidate = candidate.strip()
-        if candidate and candidate not in seen:
-            unique.append(candidate)
-            seen.add(candidate)
-    return unique
-
-
 def normalize_storage_manage_base_url(base_url: str) -> str:
     base = str(base_url or "").strip().rstrip("/")
     for suffix in ("/api/storage", "/api/storage/"):
@@ -662,6 +626,7 @@ def iter_capture_events(
     frame_num = coerce_int(payload.get("frame_num"))
     ntp_timestamp = coerce_int(payload.get("ntp_timestamp"))
     produced_at = payload.get("produced_at")
+    payload_asset_id = optional_text(image.get("asset_id"))
     payload_file_name = (
         optional_text(image.get("image_path"))
         or optional_text(image.get("file_name"))
@@ -717,7 +682,8 @@ def iter_capture_events(
         )
         if event_type in STORAGE_SOURCE_EVENT_TYPES:
             logging.debug(
-                "Kafka event image_path=%s event_type=%s plate=%s cam=%s tracking_object_id=%s",
+                "Kafka event asset_id=%s image_path=%s event_type=%s plate=%s cam=%s tracking_object_id=%s",
+                payload_asset_id or "",
                 source_file_name or "",
                 event_type,
                 plate,
@@ -745,6 +711,7 @@ def iter_capture_events(
             image_width=image_width,
             image_height=image_height,
             received_monotonic=received_monotonic,
+            source_asset_id=payload_asset_id,
             source_file_name=source_file_name,
             ai_result=dict(result),
             placeholder=placeholder
@@ -777,6 +744,10 @@ class CooldownDeduper:
         self._last_seen[key] = float(self.clock())
 
 
+class StorageAuthorizationError(RuntimeError):
+    pass
+
+
 class StorageAssetClient:
     def __init__(
         self,
@@ -798,54 +769,36 @@ class StorageAssetClient:
     def headers(self) -> Dict[str, str]:
         return {"X-Service-Token": self.token} if self.token else {}
 
-    def find_assets_by_file_path(self, file_path: str, *, device_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        filename = os.path.basename(file_path)
-        path_candidates = set(storage_file_path_candidates(file_path))
-        params = {
-            "asset_type": "snapshot",
-            "search": filename,
-            "page": 1,
-            "page_size": 20,
-        }
-        if device_id:
-            params["device_id"] = device_id
-
-        response = self.session.get(
-            f"{self.base_url}/api/admin/assets",
-            params=params,
+    def get_access_url(self, asset_id: Any) -> str:
+        asset_id_text = optional_text(asset_id)
+        if asset_id_text is None:
+            raise ValueError("asset_id is required")
+        response = self.session.post(
+            f"{self.base_url}/api/storage/get-access-url",
+            json={
+                "asset_id": asset_id_text,
+                "access_scope": "file",
+                "duration": 300,
+                "as_attachment": False,
+            },
             headers=self.headers(),
             timeout=self.timeout_sec,
         )
         if response.status_code == 401:
-            raise RuntimeError("storage API returned 401 unauthorized")
-        response.raise_for_status()
-        assets = response.json().get("assets", [])
-        exact_matches = [
-            asset for asset in assets
-            if asset.get("file_path") in path_candidates or asset.get("filename") == filename
-        ]
-        return exact_matches or assets
-
-    def get_preview_url(self, asset_id: Any) -> str:
-        response = self.session.get(
-            f"{self.base_url}/api/admin/assets/{asset_id}/preview-url",
-            headers=self.headers(),
-            timeout=self.timeout_sec,
-        )
-        if response.status_code == 401:
-            raise RuntimeError("storage API returned 401 unauthorized while requesting preview URL")
+            raise StorageAuthorizationError("storage API returned 401 unauthorized while requesting asset access URL")
+        if response.status_code == 403:
+            raise StorageAuthorizationError("storage API returned 403 forbidden while requesting asset access URL")
         response.raise_for_status()
         return urljoin(f"{self.base_url}/", str(response.json()["access_url"]))
 
-    def download_by_file_path(self, file_path: str, *, device_id: Optional[str] = None) -> Tuple[bytes, Dict[str, Any], str]:
+    def download_by_asset_id(self, asset_id: Any) -> Tuple[bytes, Dict[str, Any], str]:
+        asset_id_text = optional_text(asset_id)
+        if asset_id_text is None:
+            raise ValueError("asset_id is required")
         last_error: Optional[Exception] = None
         for attempt in range(self.retries + 1):
             try:
-                assets = self.find_assets_by_file_path(file_path, device_id=device_id)
-                if not assets:
-                    raise RuntimeError(f"no matching storage asset for {file_path}")
-                asset = assets[0]
-                preview_url = self.get_preview_url(asset["id"])
+                preview_url = self.get_access_url(asset_id_text)
                 response = self.session.get(preview_url, timeout=self.timeout_sec)
                 response.raise_for_status()
                 content_type = response.headers.get("Content-Type", "").lower()
@@ -853,12 +806,17 @@ class StorageAssetClient:
                     raise RuntimeError(f"storage preview response is not an image: {content_type}")
                 if not response.content:
                     raise RuntimeError("storage preview returned empty body")
-                return response.content, asset, preview_url
+                return response.content, {"id": asset_id_text}, preview_url
+            except StorageAuthorizationError as exc:
+                raise RuntimeError(f"failed to download storage asset_id={asset_id_text}: {exc}") from exc
             except Exception as exc:
                 last_error = exc
                 if attempt < self.retries:
                     time.sleep(self.retry_delay_sec)
-        raise RuntimeError(f"failed to download storage asset after {self.retries + 1} attempts: {last_error}")
+        raise RuntimeError(
+            f"failed to download storage asset_id={asset_id_text} "
+            f"after {self.retries + 1} attempts: {last_error}"
+        )
 
 
 def sanitize_timestamp(value: str) -> str:
@@ -1161,6 +1119,7 @@ class SnapshotClient:
             "event_type": event.event_type,
             "image_width": event.image_width,
             "image_height": event.image_height,
+            "asset_id": event.source_asset_id,
             "image_path": event.source_file_name,
             "source_file_name": event.source_file_name,
             "source_method": source_method,
@@ -1199,11 +1158,9 @@ class SnapshotClient:
             metadata["plate_image_file"] = str(plate_output_path)
         if storage_asset is not None:
             metadata["storage_asset"] = {
-                "id": storage_asset.get("id"),
-                "file_path": storage_asset.get("file_path"),
-                "filename": storage_asset.get("filename"),
-                "device_id": storage_asset.get("device_id"),
-                "timestamp": storage_asset.get("timestamp"),
+                key: storage_asset[key]
+                for key in ("id", "file_path", "filename", "device_id", "timestamp")
+                if storage_asset.get(key) is not None
             }
         if storage_preview_url is not None:
             metadata["storage_preview_url"] = storage_preview_url
@@ -1551,8 +1508,9 @@ class SnapshotClient:
             return True
         except Exception as exc:
             logging.warning(
-                "Failed to crop plate image from storage plate=%s file=%s plate_bbox=%s: %s",
+                "Failed to crop plate image from storage plate=%s asset_id=%s file=%s plate_bbox=%s: %s",
                 event.plate,
+                event.source_asset_id or "",
                 event.source_file_name or "",
                 bbox_to_metadata(event.plate_bbox),
                 exc,
@@ -1563,8 +1521,8 @@ class SnapshotClient:
         storage_date = str(storage_date or self.current_storage_date())
         if self.storage_asset_client is None:
             raise RuntimeError("storage asset client is not configured")
-        if not event.source_file_name:
-            raise RuntimeError("event has no source_file_name")
+        if not event.source_asset_id:
+            raise RuntimeError("event has no source_asset_id")
 
         output_dir = self.plate_dir(event.plate, storage_date=storage_date)
         existing_record = self.find_existing_record(event, storage_date=storage_date)
@@ -1573,15 +1531,12 @@ class SnapshotClient:
         metadata_path = self.metadata_path_for_image(output_path)
 
         if self.dry_run:
-            logging.info("Dry-run storage snapshot image_path=%s output=%s", event.source_file_name, output_path)
-            return {"url": event.source_file_name, "file": str(output_path), "status": "dry_run"}
+            logging.info("Dry-run storage snapshot asset_id=%s output=%s", event.source_asset_id, output_path)
+            return {"url": f"asset:{event.source_asset_id}", "file": str(output_path), "status": "dry_run"}
 
         request_started = time.monotonic()
         output_dir.mkdir(parents=True, exist_ok=True)
-        image_bytes, asset, preview_url = self.storage_asset_client.download_by_file_path(
-            event.source_file_name,
-            device_id=event.trigger_cam_id,
-        )
+        image_bytes, asset, preview_url = self.storage_asset_client.download_by_asset_id(event.source_asset_id)
         crop_started = time.monotonic()
         wrote_plate_crop = self.crop_storage_image_to_file(
             image_bytes,
@@ -1602,7 +1557,7 @@ class SnapshotClient:
             request_elapsed_ms=request_elapsed_ms,
             total_latency_ms=total_latency_ms,
             api_crop_elapsed_ms=crop_elapsed_ms,
-            source_method="storage_file_name",
+            source_method="storage_asset_id",
             storage_asset=asset,
             storage_preview_url=preview_url,
             plate_output_path=plate_output_path if wrote_plate_crop else None,
@@ -1617,13 +1572,14 @@ class SnapshotClient:
         )
 
         logging.info(
-            "Snapshot saved from storage group=%s role=%s plate=%s event_type=%s confidence=%.4f trigger_cam=%s image_path=%s file=%s request_ms=%.1f total_latency_ms=%s crop_ms=%.1f",
+            "Snapshot saved from storage group=%s role=%s plate=%s event_type=%s confidence=%.4f trigger_cam=%s asset_id=%s image_path=%s file=%s request_ms=%.1f total_latency_ms=%s crop_ms=%.1f",
             event.group_id,
             event.capture_role,
             event.plate,
             event.event_type,
             event.confidence,
             event.trigger_cam_id,
+            event.source_asset_id,
             event.source_file_name,
             output_path,
             request_elapsed_ms,
@@ -1777,11 +1733,11 @@ class SnapshotClient:
 
     def capture(self, event: CaptureEvent, *, storage_date: Optional[str] = None) -> Dict[str, Any]:
         storage_date = str(storage_date or self.current_storage_date())
-        if event.event_type in STORAGE_SOURCE_EVENT_TYPES and event.source_file_name:
+        if event.event_type in STORAGE_SOURCE_EVENT_TYPES and event.source_asset_id:
             return self.capture_from_storage_source(event, storage_date=storage_date)
-        if event.event_type in STORAGE_SOURCE_EVENT_TYPES and not event.source_file_name:
+        if event.event_type in STORAGE_SOURCE_EVENT_TYPES and not event.source_asset_id:
             logging.warning(
-                "%s has no image_path; falling back to camera capture plate=%s cam=%s tracking_object_id=%s",
+                "%s has no asset_id; falling back to camera capture plate=%s cam=%s tracking_object_id=%s",
                 event.event_type,
                 event.plate,
                 event.trigger_cam_id,
@@ -1883,6 +1839,7 @@ class VehicleCaptureProcessor:
                         image_width=event.image_width,
                         image_height=event.image_height,
                         received_monotonic=event.received_monotonic,
+                        source_asset_id=event.source_asset_id,
                         source_file_name=event.source_file_name,
                         ai_result=event.ai_result,
                         placeholder=event.placeholder,
@@ -1909,10 +1866,11 @@ class VehicleCaptureProcessor:
             groups = self.groups_by_trigger_cam.get(event.trigger_cam_id)
             if self.service_config.camera_groups and not groups:
                 logging.debug(
-                    "Skipping cam=%s because it is not configured in any camera_group plate=%s event_type=%s image_path=%s",
+                    "Skipping cam=%s because it is not configured in any camera_group plate=%s event_type=%s asset_id=%s image_path=%s",
                     event.trigger_cam_id,
                     event.plate,
                     event.event_type,
+                    event.source_asset_id or "",
                     event.source_file_name or "",
                 )
                 continue

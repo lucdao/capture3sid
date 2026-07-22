@@ -38,6 +38,7 @@ def make_event(plate, *, track=1, role="back", cam="2927D-02", produced_at="2026
         image_width=1920,
         image_height=1080,
         received_monotonic=None,
+        source_asset_id=None,
         source_file_name=None,
         ai_result={},
         placeholder={},

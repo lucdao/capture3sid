@@ -117,9 +117,25 @@ def sync_once(args: argparse.Namespace) -> Dict[str, int]:
     output_root = Path(args.output_root)
     state_path = Path(args.state_file)
     state = load_state(state_path)
+    mode = str(getattr(args, "mode", "capture") or "capture")
     requested_location = str(args.location or args.camera_group or "")
-    state_location = str(state.get("location") or state.get("camera_group") or "")
-    state_since = state.get("since") if state_location == requested_location else None
+    stream_key = f"{mode}:{requested_location}"
+    streams = dict(state.get("streams")) if isinstance(state.get("streams"), dict) else {}
+    legacy_since = state.get("since")
+    legacy_mode = str(state.get("mode") or "capture")
+    legacy_location = str(state.get("location") or state.get("camera_group") or "")
+    legacy_key = f"{legacy_mode}:{legacy_location}"
+    if legacy_since and legacy_key not in streams:
+        streams[legacy_key] = {
+            "since": legacy_since,
+            "last_sync_unix": state.get("last_sync_unix"),
+            "base_url": state.get("base_url"),
+            "location": legacy_location,
+            "camera_group": legacy_location,
+            "mode": legacy_mode,
+        }
+    stream_state = streams.get(stream_key) if isinstance(streams.get(stream_key), dict) else {}
+    state_since = stream_state.get("since")
     since = args.since or state_since or DEFAULT_SINCE
     cursor: Optional[str] = None
     pages = 0
@@ -130,7 +146,7 @@ def sync_once(args: argparse.Namespace) -> Dict[str, int]:
     session = requests.Session()
 
     while True:
-        params: Dict[str, Any] = {"limit": args.limit}
+        params: Dict[str, Any] = {"limit": args.limit, "mode": mode}
         if args.camera_group:
             params["camera_group"] = args.camera_group
         if args.location:
@@ -174,14 +190,22 @@ def sync_once(args: argparse.Namespace) -> Dict[str, int]:
         if not payload.get("has_more"):
             next_since = payload.get("next_since")
             if not args.dry_run and next_since:
+                next_streams = dict(streams)
+                next_streams[stream_key] = {
+                    "since": next_since,
+                    "last_sync_unix": time.time(),
+                    "base_url": base_url,
+                    "location": requested_location,
+                    "camera_group": requested_location,
+                    "mode": mode,
+                }
                 write_state(
                     state_path,
                     {
-                        "since": next_since,
+                        "version": 2,
+                        "streams": next_streams,
                         "last_sync_unix": time.time(),
                         "base_url": base_url,
-                        "location": requested_location,
-                        "camera_group": requested_location,
                     },
                 )
             return {"pages": pages, "items": items, "downloads": downloads}
@@ -191,14 +215,15 @@ def sync_once(args: argparse.Namespace) -> Dict[str, int]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Test client for the vehicle capture sync API.")
+    parser = argparse.ArgumentParser(description="Test client for the capture and document sync API.")
      
     parser.add_argument("--base-url",default="https://imagesync.ivistatech.vn")
     parser.add_argument("--token", default=os.environ.get("SYNC_TOKEN", ""))
     parser.add_argument("--output-root", default="synced_vehicle_captures")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     parser.add_argument("--since", help="Override saved_at cursor, for example 2026-07-02T00:00:00Z")
-    parser.add_argument("--location", help="Only sync captures from one location id or location name.")
+    parser.add_argument("--mode", choices=("capture", "document"), default="capture")
+    parser.add_argument("--location", help="Only sync items from one location id or location name.")
     parser.add_argument("--camera-group", help="Deprecated alias for --location.")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--timeout-sec", type=float, default=30.0)

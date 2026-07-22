@@ -13,11 +13,15 @@ from fastapi import HTTPException
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from capture_sync_api import (
+    DocumentBatchItem,
+    DocumentSubmitPayload,
     SubmitPayload,
     build_changes_manifest,
     create_app,
     load_camera_group_index,
     resolve_relative_path,
+    save_document_batch,
+    save_document_submit,
     save_mobile_submit,
     validate_submit_token,
 )
@@ -117,6 +121,17 @@ def submit_payload(**overrides):
     return payload
 
 
+def document_payload(**overrides):
+    payload = {
+        "image": test_image_data_url(),
+        "deviceId": "DKV3_2927D",
+        "timestamp": "2026-06-29T23:30:00+07:00",
+        "recordId": "document-record-1",
+    }
+    payload.update(overrides)
+    return payload
+
+
 class CaptureSyncApiTests(unittest.TestCase):
     def test_mobile_submit_route_is_registered(self):
         provider = Mock()
@@ -146,6 +161,7 @@ class CaptureSyncApiTests(unittest.TestCase):
         }
 
         self.assertEqual(len(submit_routes), 1)
+        self.assertIn(("/api/documents", "POST"), routes)
         self.assertIn(("/api/admin/camera-groups", "GET"), routes)
         self.assertNotIn(("/api/admin/camera-groups", "PUT"), routes)
         self.assertNotIn(("/admin/camera-groups", "GET"), routes)
@@ -256,6 +272,156 @@ class CaptureSyncApiTests(unittest.TestCase):
             self.assertFalse(plate_image_path.exists())
             self.assertNotIn("plate_image_file", metadata)
 
+    def test_document_submit_saves_image_and_metadata_without_plate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = save_document_submit(
+                Path(tmp),
+                DocumentSubmitPayload(**document_payload()),
+                storage_timezone="Asia/Ho_Chi_Minh",
+            )
+
+            document_id = result["document_id"]
+            folder = Path(tmp) / "_documents" / "2026-06-29" / "DKV3_2927D"
+            image_path = folder / f"{document_id}.jpg"
+            metadata_path = folder / f"{document_id}.json"
+            self.assertEqual(image_path.read_bytes(), b"\xff\xd8\xffmobile")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["document_id"], document_id)
+            self.assertEqual(metadata["device_id"], "DKV3_2927D")
+            self.assertEqual(metadata["record_id"], "document-record-1")
+            self.assertEqual(metadata["storage_date"], "2026-06-29")
+            self.assertEqual(metadata["produced_at"], "2026-06-29T16:30:00Z")
+            self.assertEqual(metadata["source_method"], "document_submit")
+            self.assertNotIn("plate", metadata)
+            self.assertEqual(result["image_path"], str(image_path))
+            self.assertEqual(result["metadata_path"], str(metadata_path))
+
+    def test_document_submit_preserves_supported_image_extensions(self):
+        samples = {
+            "jpg": b"\xff\xd8\xffimage",
+            "png": b"\x89PNG\r\n\x1a\nimage",
+            "gif": b"GIF89aimage",
+            "webp": b"RIFF\x04\x00\x00\x00WEBPimage",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for extension, content in samples.items():
+                with self.subTest(extension=extension):
+                    payload = document_payload(image=base64.b64encode(content).decode("ascii"))
+                    result = save_document_submit(Path(tmp), DocumentSubmitPayload(**payload))
+                    self.assertEqual(Path(result["image_path"]).suffix, f".{extension}")
+
+    def test_document_submit_sanitizes_device_folder_and_generates_unique_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = DocumentSubmitPayload(**document_payload(deviceId=" device/../one ", recordId=None))
+            first = save_document_submit(Path(tmp), payload)
+            second = save_document_submit(Path(tmp), payload)
+
+            self.assertNotEqual(first["document_id"], second["document_id"])
+            self.assertEqual(Path(first["image_path"]).parent.name, "DEVICE____ONE")
+            self.assertIsNone(first["record_id"])
+            self.assertTrue(Path(first["image_path"]).is_file())
+            self.assertTrue(Path(second["image_path"]).is_file())
+
+    def test_document_submit_rejects_missing_device_invalid_timestamp_and_invalid_image(self):
+        invalid_payloads = [
+            document_payload(deviceId=""),
+            document_payload(timestamp="not-a-timestamp"),
+            document_payload(image=base64.b64encode(b"not an image").decode("ascii")),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for payload in invalid_payloads:
+                with self.subTest(payload=payload):
+                    with self.assertRaises(ValueError):
+                        save_document_submit(Path(tmp), DocumentSubmitPayload(**payload))
+
+    def test_document_submit_uses_existing_submit_authentication(self):
+        for supplied in ("", "wrong"):
+            with self.assertRaises(HTTPException) as ctx:
+                validate_submit_token("secret", supplied)
+            self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_document_batch_saves_mixed_formats_and_syncs_each_document(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            documents = [
+                DocumentBatchItem(
+                    image=base64.b64encode(b"\xff\xd8\xfffirst").decode("ascii"),
+                    recordId="batch-record-1",
+                ),
+                DocumentBatchItem(
+                    image=base64.b64encode(b"\x89PNG\r\n\x1a\nsecond").decode("ascii"),
+                    recordId="batch-record-2",
+                ),
+            ]
+            result = save_document_batch(
+                Path(tmp),
+                device_id="DKV3_2927D",
+                timestamp="2026-06-29T23:30:00+07:00",
+                documents=documents,
+                storage_timezone="Asia/Ho_Chi_Minh",
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["count"], 2)
+            self.assertEqual(result["device_id"], "DKV3_2927D")
+            self.assertEqual(result["storage_date"], "2026-06-29")
+            self.assertEqual(result["produced_at"], "2026-06-29T16:30:00Z")
+            self.assertEqual(
+                [item["record_id"] for item in result["documents"]],
+                ["batch-record-1", "batch-record-2"],
+            )
+            self.assertEqual(len({item["document_id"] for item in result["documents"]}), 2)
+            self.assertEqual(
+                {Path(item["image_path"]).suffix for item in result["documents"]},
+                {".jpg", ".png"},
+            )
+            for item in result["documents"]:
+                self.assertTrue(Path(item["image_path"]).is_file())
+                metadata = json.loads(Path(item["metadata_path"]).read_text(encoding="utf-8"))
+                self.assertEqual(metadata["document_id"], item["document_id"])
+                self.assertEqual(metadata["record_id"], item["record_id"])
+
+            manifest = build_changes_manifest(
+                Path(tmp),
+                since="2026-06-29T00:00:00Z",
+                cursor=None,
+                limit=10,
+                base_url="http://sync.local",
+                mode="document",
+                now=datetime.now(timezone.utc),
+            )
+            self.assertEqual(len(manifest["items"]), 2)
+            self.assertEqual(
+                {item["document_id"] for item in manifest["items"]},
+                {item["document_id"] for item in result["documents"]},
+            )
+
+    def test_document_batch_rejects_invalid_requests_before_writing(self):
+        valid = DocumentBatchItem(image=test_image_data_url(), recordId="valid")
+        invalid_cases = [
+            {"device_id": "device-01", "timestamp": "2026-06-29T12:00:00Z", "documents": []},
+            {
+                "device_id": "device-01",
+                "timestamp": "2026-06-29T12:00:00Z",
+                "documents": [valid] * 21,
+            },
+            {"device_id": "", "timestamp": "2026-06-29T12:00:00Z", "documents": [valid]},
+            {"device_id": "device-01", "timestamp": "invalid", "documents": [valid]},
+            {
+                "device_id": "device-01",
+                "timestamp": "2026-06-29T12:00:00Z",
+                "documents": [
+                    valid,
+                    DocumentBatchItem(image=base64.b64encode(b"not-an-image").decode("ascii")),
+                ],
+            },
+        ]
+
+        for case in invalid_cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(ValueError):
+                    save_document_batch(Path(tmp), **case)
+                self.assertFalse((Path(tmp) / "_documents").exists())
+
     def test_manifest_paginates_same_saved_at_with_cursor_tiebreaker(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_capture(tmp, "2026-07-02", "30A00001", "BACK_2927D02", saved_at="2026-07-02T01:00:00Z")
@@ -285,6 +451,68 @@ class CaptureSyncApiTests(unittest.TestCase):
                 first["items"][0]["relative_metadata_path"],
                 second["items"][0]["relative_metadata_path"],
             )
+
+    def test_manifest_document_mode_is_separate_paginated_and_mode_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_capture(tmp, "2026-06-29", "30A00001", "BACK_2927D02", saved_at="2026-06-29T17:00:00Z")
+            first_document = save_document_submit(
+                Path(tmp), DocumentSubmitPayload(**document_payload(recordId="first"))
+            )
+            second_document = save_document_submit(
+                Path(tmp), DocumentSubmitPayload(**document_payload(recordId="second"))
+            )
+            upper_bound = datetime.now(timezone.utc)
+
+            first = build_changes_manifest(
+                Path(tmp), since="2026-06-29T00:00:00Z", cursor=None, limit=1,
+                base_url="http://sync.local", mode="document", now=upper_bound,
+            )
+            second = build_changes_manifest(
+                Path(tmp), since=None, cursor=first["next_cursor"], limit=10,
+                base_url="http://sync.local", mode="document",
+            )
+
+            self.assertEqual(first["mode"], "document")
+            self.assertEqual(first["items"][0]["type"], "document")
+            self.assertTrue(first["has_more"])
+            self.assertEqual(len(second["items"]), 1)
+            synced_ids = {first["items"][0]["document_id"], second["items"][0]["document_id"]}
+            self.assertEqual(synced_ids, {first_document["document_id"], second_document["document_id"]})
+            with self.assertRaisesRegex(ValueError, "different mode"):
+                build_changes_manifest(
+                    Path(tmp), since=None, cursor=first["next_cursor"], limit=10,
+                    base_url="http://sync.local", mode="capture",
+                )
+
+            captures = build_changes_manifest(
+                Path(tmp), since="2026-06-29T00:00:00Z", cursor=None, limit=10,
+                base_url="http://sync.local", now=upper_bound,
+            )
+            self.assertEqual(captures["mode"], "capture")
+            self.assertTrue(all(item["type"] != "document" for item in captures["items"]))
+
+    def test_manifest_filters_documents_by_device_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            group_index = load_camera_group_index(str(write_camera_group_config(tmp)))
+            expected = save_document_submit(
+                Path(tmp), DocumentSubmitPayload(**document_payload(deviceId="DKV3_2927D"))
+            )
+            save_document_submit(
+                Path(tmp), DocumentSubmitPayload(**document_payload(deviceId="DKV3_2903V"))
+            )
+
+            result = build_changes_manifest(
+                Path(tmp), since="2026-06-29T00:00:00Z", cursor=None, limit=10,
+                base_url="http://sync.local", mode="document", location="2927D",
+                group_index=group_index, now=datetime.now(timezone.utc),
+            )
+
+            self.assertEqual([item["document_id"] for item in result["items"]], [expected["document_id"]])
+            self.assertEqual(result["items"][0]["camera_group_ids"], ["2927D"])
+            paths = {entry["relative_path"] for entry in result["items"][0]["files"]}
+            self.assertEqual(len(paths), 2)
+            self.assertTrue(any(path.endswith(".json") for path in paths))
+            self.assertTrue(any(path.endswith(".jpg") for path in paths))
 
     def test_cursor_upper_bound_excludes_new_files_during_paging(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -361,7 +589,7 @@ class CaptureSyncApiTests(unittest.TestCase):
                 base_url="http://sync.local",
                 camera_group="2903V",
                 group_index=group_index,
-                now=datetime(2026, 7, 14, 0, 0, tzinfo=timezone.utc),
+                now=datetime.now(timezone.utc),
             )
 
             self.assertEqual(len(result["items"]), 1)

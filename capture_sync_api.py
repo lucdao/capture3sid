@@ -8,8 +8,9 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Set, Tuple, Union
 from urllib.parse import quote
+from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -44,6 +45,32 @@ class SubmitPayload(BaseModel):
     timestamp: str
     recordId: Optional[str] = None
     photos: List[SubmitPhoto] = Field(default_factory=list)
+
+
+class DocumentSubmitPayload(BaseModel):
+    image: str
+    deviceId: str
+    timestamp: str
+    recordId: Optional[str] = None
+
+
+class DocumentBatchItem(BaseModel):
+    image: str
+    recordId: Optional[str] = None
+
+
+class DocumentBatchSubmitPayload(BaseModel):
+    deviceId: str
+    timestamp: str
+    documents: List[DocumentBatchItem]
+
+
+@dataclass(frozen=True)
+class PreparedDocument:
+    document_id: str
+    record_id: Optional[str]
+    image_data: bytes
+    extension: str
 
 
 @dataclass(frozen=True)
@@ -120,16 +147,20 @@ def safe_folder_name(value: Any, *, fallback: str = "UNKNOWN") -> str:
     return cleaned or fallback
 
 
+def image_extension(data: bytes) -> Optional[str]:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
 def image_bytes_look_valid(data: bytes) -> bool:
-    if not data:
-        return False
-    return (
-        data.startswith(b"\xff\xd8\xff")
-        or data.startswith(b"\x89PNG\r\n\x1a\n")
-        or data.startswith(b"GIF87a")
-        or data.startswith(b"GIF89a")
-        or (data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP")
-    )
+    return bool(data) and image_extension(data) is not None
 
 
 def decode_submit_image(value: str) -> bytes:
@@ -469,6 +500,115 @@ def save_mobile_submit(
     }
 
 
+def save_document_submit(
+    root: Path,
+    payload: DocumentSubmitPayload,
+    *,
+    storage_timezone: str = DEFAULT_STORAGE_TIMEZONE,
+) -> Dict[str, Any]:
+    batch_result = save_document_batch(
+        root,
+        device_id=payload.deviceId,
+        timestamp=payload.timestamp,
+        documents=[DocumentBatchItem(image=payload.image, recordId=payload.recordId)],
+        storage_timezone=storage_timezone,
+    )
+    saved_document = batch_result["documents"][0]
+    return {
+        "ok": True,
+        "document_id": saved_document["document_id"],
+        "device_id": batch_result["device_id"],
+        "record_id": saved_document["record_id"],
+        "storage_date": batch_result["storage_date"],
+        "produced_at": batch_result["produced_at"],
+        "saved_at": batch_result["saved_at"],
+        "image_path": saved_document["image_path"],
+        "metadata_path": saved_document["metadata_path"],
+    }
+
+
+def save_document_batch(
+    root: Path,
+    *,
+    device_id: str,
+    timestamp: str,
+    documents: List[DocumentBatchItem],
+    storage_timezone: str = DEFAULT_STORAGE_TIMEZONE,
+) -> Dict[str, Any]:
+    device_id = str(device_id or "").strip()
+    safe_device_id = safe_folder_name(device_id, fallback="")
+    if not safe_device_id:
+        raise ValueError("deviceId is required")
+    if not documents:
+        raise ValueError("documents must contain at least one item")
+    if len(documents) > 20:
+        raise ValueError("documents must contain at most 20 items")
+    try:
+        storage_tz = ZoneInfo(storage_timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"invalid storage timezone: {storage_timezone}") from exc
+
+    storage_date, produced_at = storage_date_from_timestamp(timestamp, storage_tz)
+    prepared_documents: List[PreparedDocument] = []
+    for index, document in enumerate(documents):
+        try:
+            image_data = decode_submit_image(document.image)
+        except ValueError as exc:
+            raise ValueError(f"documents[{index}]: {exc}") from exc
+        extension = image_extension(image_data)
+        if extension is None:
+            raise ValueError(f"documents[{index}]: document image is empty or unsupported")
+        prepared_documents.append(
+            PreparedDocument(
+                document_id=str(uuid4()),
+                record_id=document.recordId,
+                image_data=image_data,
+                extension=extension,
+            )
+        )
+
+    saved_at = format_iso_datetime(datetime.now(timezone.utc))
+    document_dir = root / "_documents" / storage_date / safe_device_id
+    document_dir.mkdir(parents=True, exist_ok=True)
+    saved_documents: List[Dict[str, Any]] = []
+    for document in prepared_documents:
+        image_path = document_dir / f"{document.document_id}.{document.extension}"
+        metadata_path = document_dir / f"{document.document_id}.json"
+
+        tmp_image_path = image_path.with_suffix(image_path.suffix + ".tmp")
+        tmp_image_path.write_bytes(document.image_data)
+        os.replace(tmp_image_path, image_path)
+        metadata = {
+            "document_id": document.document_id,
+            "device_id": device_id,
+            "record_id": document.record_id,
+            "storage_date": storage_date,
+            "produced_at": produced_at,
+            "saved_at": saved_at,
+            "source_method": "document_submit",
+            "file": str(image_path),
+        }
+        atomic_write_json(metadata_path, metadata)
+        saved_documents.append(
+            {
+                "document_id": document.document_id,
+                "record_id": document.record_id,
+                "image_path": str(image_path),
+                "metadata_path": str(metadata_path),
+            }
+        )
+
+    return {
+        "ok": True,
+        "count": len(saved_documents),
+        "device_id": device_id,
+        "storage_date": storage_date,
+        "produced_at": produced_at,
+        "saved_at": saved_at,
+        "documents": saved_documents,
+    }
+
+
 def encode_cursor(payload: Dict[str, Any]) -> str:
     raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -642,9 +782,61 @@ def iter_review_items(root: Path, *, base_url: str, group_index: CameraGroupInde
             }
 
 
-def manifest_items(root: Path, *, base_url: str, group_index: CameraGroupIndex) -> List[Dict[str, Any]]:
-    items = list(iter_capture_items(root, base_url=base_url, group_index=group_index))
-    items.extend(iter_review_items(root, base_url=base_url, group_index=group_index))
+def iter_document_items(root: Path, *, base_url: str, group_index: CameraGroupIndex) -> Iterable[Dict[str, Any]]:
+    pattern = "_documents/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/*/*.json"
+    for metadata_path in sorted(root.glob(pattern)):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logging.warning("Skipping unreadable document metadata %s: %s", metadata_path, exc)
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        saved_at = parse_iso_datetime(metadata.get("saved_at"))
+        if saved_at is None:
+            continue
+
+        image_path = path_from_metadata_value(root, metadata.get("file"))
+        candidates = [metadata_path]
+        if image_path is not None:
+            candidates.append(image_path)
+        files: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(root.resolve())
+            except ValueError:
+                continue
+            if resolved.is_file():
+                files.append(file_entry(root, resolved, base_url=base_url))
+
+        yield {
+            "type": "document",
+            "sync_timestamp": format_iso_datetime(saved_at),
+            "saved_at": format_iso_datetime(saved_at),
+            "relative_metadata_path": relative_path(root, metadata_path),
+            "document_id": metadata.get("document_id") or metadata_path.stem,
+            "device_id": metadata.get("device_id"),
+            "record_id": metadata.get("record_id"),
+            "storage_date": metadata.get("storage_date") or metadata_path.parent.parent.name,
+            "produced_at": metadata.get("produced_at"),
+            "camera_group_ids": camera_group_ids_for_metadata(metadata, group_index),
+            "files": files,
+        }
+
+
+def manifest_items(
+    root: Path,
+    *,
+    base_url: str,
+    group_index: CameraGroupIndex,
+    mode: str = "capture",
+) -> List[Dict[str, Any]]:
+    if mode == "document":
+        items = list(iter_document_items(root, base_url=base_url, group_index=group_index))
+    else:
+        items = list(iter_capture_items(root, base_url=base_url, group_index=group_index))
+        items.extend(iter_review_items(root, base_url=base_url, group_index=group_index))
     items.sort(key=lambda item: (item["sync_timestamp"], item["relative_metadata_path"]))
     return items
 
@@ -656,11 +848,15 @@ def build_changes_manifest(
     cursor: Optional[str],
     limit: int,
     base_url: str,
+    mode: str = "capture",
     location: Optional[str] = None,
     camera_group: Optional[str] = None,
     group_index: Optional[CameraGroupIndex] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
+    mode = str(mode or "capture").strip().lower()
+    if mode not in ("capture", "document"):
+        raise ValueError("mode must be capture or document")
     limit = max(1, min(MAX_LIMIT, int(limit or DEFAULT_LIMIT)))
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     group_index = group_index or CameraGroupIndex(group_names={}, cam_to_group={})
@@ -674,10 +870,13 @@ def build_changes_manifest(
             last_relative_path = str(cursor_payload.get("last_relative_path") or "")
             since_dt = parse_iso_datetime(cursor_payload.get("since"))
             selected_group = str(cursor_payload.get("camera_group") or "") or None
+            selected_mode = str(cursor_payload.get("mode") or "capture")
         except ValueError as exc:
             raise ValueError("invalid cursor") from exc
         if upper_bound is None or since_dt is None:
             raise ValueError("invalid cursor")
+        if mode != selected_mode:
+            raise ValueError("cursor belongs to a different mode")
         requested_group = requested_location
         if requested_group:
             requested_group = group_index.canonical_group_id(requested_group) or requested_group
@@ -691,6 +890,7 @@ def build_changes_manifest(
         last_timestamp = ""
         last_relative_path = ""
         selected_group = requested_location
+        selected_mode = mode
 
     if selected_group:
         canonical_group = group_index.canonical_group_id(selected_group)
@@ -700,7 +900,7 @@ def build_changes_manifest(
             raise ValueError(f"unknown location: {selected_group}")
 
     selected: List[Dict[str, Any]] = []
-    for item in manifest_items(root, base_url=base_url, group_index=group_index):
+    for item in manifest_items(root, base_url=base_url, group_index=group_index, mode=selected_mode):
         item_dt = parse_iso_datetime(item.get("sync_timestamp"))
         if item_dt is None:
             continue
@@ -724,6 +924,7 @@ def build_changes_manifest(
                 "last_timestamp": last["sync_timestamp"],
                 "last_relative_path": last["relative_metadata_path"],
                 "camera_group": selected_group,
+                "mode": selected_mode,
             }
         )
         next_since = None
@@ -737,6 +938,7 @@ def build_changes_manifest(
         "upper_bound": format_iso_datetime(upper_bound),
         "location": selected_group,
         "camera_group": selected_group,
+        "mode": selected_mode,
         "next_cursor": next_cursor,
         "next_since": next_since,
         "has_more": has_more,
@@ -813,6 +1015,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         request: Request,
         since: Optional[str] = Query(None),
         cursor: Optional[str] = Query(None),
+        mode: Literal["capture", "document"] = Query("capture"),
         location: Optional[str] = Query(None),
         camera_group: Optional[str] = Query(None),
         limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
@@ -827,6 +1030,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 cursor=cursor,
                 limit=limit,
                 base_url=base_url,
+                mode=mode,
                 location=location,
                 camera_group=camera_group,
                 group_index=app.state.group_index,
@@ -854,11 +1058,29 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+    @app.post("/api/documents")
+    async def submit_document(
+        payload: Union[DocumentSubmitPayload, DocumentBatchSubmitPayload] = Body(...),
+        _auth: None = Depends(require_submit_auth),
+    ) -> Dict[str, Any]:
+        try:
+            if isinstance(payload, DocumentBatchSubmitPayload):
+                return save_document_batch(
+                    output_root,
+                    device_id=payload.deviceId,
+                    timestamp=payload.timestamp,
+                    documents=payload.documents,
+                    storage_timezone=storage_timezone,
+                )
+            return save_document_submit(output_root, payload, storage_timezone=storage_timezone)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     return app
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Serve timestamp-based sync manifests for vehicle captures.")
+    parser = argparse.ArgumentParser(description="Serve timestamp-based sync manifests for captures and documents.")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--output-root", default=os.environ.get("SYNC_OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT))
